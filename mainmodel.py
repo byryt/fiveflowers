@@ -194,3 +194,86 @@ def get_validation_dataset():
 validation_dataset = get_validation_dataset()
 
 display_9_images_from_dataset(validation_dataset)
+
+with strategy.scope():
+    img_adjust_layer = tf.keras.layers.Lambda(lambda data: tf.keras.applications.xception.preprocess_input(tf.cast(data, tf.float32)), input_shape=[*IMAGE_SIZE, 3])
+    pretrained_model = tf.keras.applications.Xception(weights='imagenet', include_top=False)
+
+    # alternative: EfficientNetB0
+
+    #img_adjust_layer = tf.keras.layers.Lambda(lambda data: tf.keras.applications.efficientnet.preprocess_input(tf.cast(data, tf.float32)), input_shape=[*IMAGE_SIZE, 3])
+    #pretrained_model = tf.keras.applications.EfficientNetB0(include_top=False)
+
+    # alternative: load a model from Tensorflow Hub.
+    # On TPU, the load_options '/job:localhost' is required to load models directly from TF Hub
+    # The expected image format for all TFHub image models is float32 in [0,1) range.
+
+    #img_adjust_layer = tf.keras.layers.Lambda(lambda data: tf.image.convert_image_dtype(data, tf.float32), input_shape=[*IMAGE_SIZE, 3])
+    #load_locally = tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+    #pretrained_model = tfhub.KerasLayer("https://tfhub.dev/tensorflow/efficientnet/b0/feature-vector/1", load_options=load_locally)
+
+    # Please remove GlobalAveragePooling2D fro the model below if using EfficientNetB0 from TF Hub as it is already included.
+
+    pretrained_model.trainable = True
+
+    model = tf.keras.Sequential([
+        img_adjust_layer,
+        pretrained_model,
+        tf.keras.layers.GlobalAveragePooling2D(),
+        #tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(5, activation='softmax')
+    ])
+
+model.compile(
+    optimizer='adam',
+    loss = 'categorical_crossentropy',
+    metrics=['accuracy'],
+    # NEW on TPU in TensorFlow 24: sending multiple batches to the TPU at once saves communications
+    # overheads and allows the XLA compiler to unroll the loop on TPU and optimize hardware utilization.
+    steps_per_execution=8
+)
+
+model.summary()
+history = model.fit(get_training_dataset(), steps_per_epoch=TRAIN_STEPS, epochs=EPOCHS,
+                    validation_data=get_validation_dataset(), validation_steps=VALIDATION_STEPS,
+                    callbacks=[lr_callback])
+
+final_accuracy = history.history["val_accuracy"][-5:]
+print("FINAL ACCURACY MEAN-5: ", np.mean(final_accuracy))
+
+display_training_curves(history.history['accuracy'][1:], history.history['val_accuracy'][1:], 'accuracy', 211)
+display_training_curves(history.history['loss'][1:], history.history['val_loss'][1:], 'loss', 212)
+# a couple of images to test predictions too
+some_flowers, some_labels = dataset_to_numpy_util(get_validation_dataset(), 160)
+# randomize the input so that you can execute multiple times to change results
+permutation = np.random.permutation(8*20)
+some_flowers, some_labels = (some_flowers[permutation], some_labels[permutation])
+
+predictions = model.predict(some_flowers, batch_size=16)
+evaluations = model.evaluate(some_flowers, some_labels, batch_size=16)
+  
+print(np.array(CLASSES)[np.argmax(predictions, axis=-1)].tolist())
+print('[val_loss, val_acc]', evaluations)
+
+display_9_images_with_predictions(some_flowers, predictions, some_labels)
+# New in Tensorflow 2.4: models can be save locally from TPUs in Tensorflow's SavedModel format
+
+# TPUs need this extra setting to save to local disk, otherwise, they can only save models to GCS (Google Cloud Storage).
+# The setting instructs Tensorflow to retrieve all parameters from the TPU then do the saving from the local VM, not the TPU.
+# This setting does nothing on GPUs.
+save_locally = tf.saved_model.SaveOptions(experimental_io_device='/job:localhost')
+model.save('./model', options=save_locally) # saving in Tensorflow's "saved model" format
+# New in Tensorflow 2.4: models can be reloaded locally to TPUs in Tensorflow's SavedModel format
+
+with strategy.scope():
+    # TPUs need this extra setting to load from local disk, otherwise, they can only load models from GCS (Google Cloud Storage).
+    # The setting instructs Tensorflow do the model loading on the local VM, not the TPU. Tensorflow can then still
+    # instantiate the model on the TPU if the loading call is placed in a TPUStrategy scope. This setting does nothing on GPUs.
+    load_locally = tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+    model = tf.keras.models.load_model('./model', options=load_locally) # loading in Tensorflow's "saved model" format
+
+predictions = model.predict(tf.cast(some_flowers, tf.float32), batch_size=16)
+evaluations = model.evaluate(tf.cast(some_flowers, tf.float32), some_labels, batch_size=16)
+print(np.array(CLASSES)[np.argmax(predictions, axis=-1)].tolist())
+print('[val_loss, val_acc]', evaluations)
+display_9_images_with_predictions(some_flowers, predictions, some_labels)
